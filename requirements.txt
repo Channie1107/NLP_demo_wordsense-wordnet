@@ -4,3 +4,4 @@ nltk==3.9.1
 transformers==4.44.2
 torch==2.4.1
 numpy==2.1.1
+huggingface_hub>=0.20.0
