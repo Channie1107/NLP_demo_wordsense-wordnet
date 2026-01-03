@@ -1,11 +1,7 @@
-streamlit==1.31.1
-
+gradio
 numpy
 scikit-learn
-
 nltk
-
-torch==2.1.2
-transformers==4.36.2
-
+torch
+transformers
 huggingface_hub
