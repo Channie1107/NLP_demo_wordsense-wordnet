@@ -15,24 +15,28 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 
-# LOGGING
+from huggingface_hub import hf_hub_download  
+
+
+# CONFIG
+HF_REPO = "Channie1107/wsd-artifacts"   
+HF_FILENAME = "cpu_pack.pkl"
+
+ARTIFACT_DIR = "artifacts"
+PKL_PATH = os.path.join(ARTIFACT_DIR, "cpu_pack.pkl")
+
+
+# LOGGING (console-first)
 def setup_logger() -> logging.Logger:
-    os.makedirs("logs", exist_ok=True)
     logger = logging.getLogger("wsd_app")
     logger.setLevel(logging.INFO)
 
     if not logger.handlers:
         fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-        fh = logging.FileHandler("logs/app.log", encoding="utf-8")
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(fmt)
-
         sh = logging.StreamHandler(sys.stdout)
         sh.setLevel(logging.INFO)
         sh.setFormatter(fmt)
-
-        logger.addHandler(fh)
         logger.addHandler(sh)
 
     return logger
@@ -40,15 +44,13 @@ def setup_logger() -> logging.Logger:
 
 LOGGER = setup_logger()
 
+
 # PAGE / STYLE
 st.set_page_config(page_title="WSD Demo", page_icon="🧠", layout="wide")
 
 CUSTOM_CSS = """
 <style>
-/* page padding */
 .block-container { padding-top: 1.6rem; padding-bottom: 2.2rem; }
-
-/* subtle header */
 .app-hero {
   border: 1px solid rgba(49, 51, 63, 0.12);
   border-radius: 18px;
@@ -58,8 +60,6 @@ CUSTOM_CSS = """
 }
 .app-hero h1 { margin: 0 0 .25rem 0; font-size: 1.65rem; }
 .app-hero p  { margin: 0; color: rgba(49, 51, 63, 0.72); }
-
-/* cards */
 .card {
   border: 1px solid rgba(49, 51, 63, 0.12);
   border-radius: 16px;
@@ -87,10 +87,7 @@ CUSTOM_CSS = """
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
   font-size: 0.92rem;
 }
-.small {
-  font-size: 0.9rem;
-  color: rgba(49, 51, 63, 0.72);
-}
+.small { font-size: 0.9rem; color: rgba(49, 51, 63, 0.72); }
 .kv {
   display: grid;
   grid-template-columns: 140px 1fr;
@@ -125,9 +122,43 @@ def ensure_nltk():
 
 ensure_nltk()
 
-# TOKENIZE / VALIDATE 
+# DOWNLOAD SVM PACK FROM HF
+@st.cache_resource
+def ensure_cpu_pack() -> str:
+    """
+    Ensure cpu_pack.pkl exists locally.
+    Downloads from Hugging Face once and caches.
+    Returns local path.
+    """
+    os.makedirs(ARTIFACT_DIR, exist_ok=True)
+
+    if os.path.exists(PKL_PATH):
+        return PKL_PATH
+
+    LOGGER.info("Downloading cpu_pack.pkl from HF: %s / %s", HF_REPO, HF_FILENAME)
+    try:
+        # Download into artifacts/ (no symlink to avoid Windows/cloud issues)
+        hf_hub_download(
+            repo_id=HF_REPO,
+            filename=HF_FILENAME,
+            local_dir=ARTIFACT_DIR,
+            local_dir_use_symlinks=False,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Cannot download cpu_pack.pkl from Hugging Face.\n"
+            f"- repo_id: {HF_REPO}\n"
+            f"- filename: {HF_FILENAME}\n"
+            "Check that the file is uploaded and repo_id is correct."
+        ) from e
+
+    if not os.path.exists(PKL_PATH):
+        raise FileNotFoundError("Downloaded but cpu_pack.pkl still not found in artifacts/")
+
+    return PKL_PATH
+
+# TOKENIZE / VALIDATE
 def simple_tokenize_like_dataset(sentence: str) -> List[str]:
-    # keep punctuation as separate tokens (helps indexing)
     sentence = re.sub(r"([.,!?;:()\"'])", r" \1 ", sentence)
     sentence = re.sub(r"\s+", " ", sentence).strip()
     return sentence.split()
@@ -151,15 +182,10 @@ def normalize_pos(wn_pos: Optional[str]) -> Optional[str]:
     POS_MAP = {"noun": "n", "verb": "v", "adj": "a", "adv": "r", "n": "n", "v": "v", "a": "a", "r": "r"}
     return POS_MAP.get(wn_pos, None)
 
-
-# LOAD SVM PACK (required for SVM method)
+# LOAD SVM PACK
 @st.cache_resource
-def load_cpu_pack(pkl_path: str = "cpu_pack.pkl"):
-    if not os.path.exists(pkl_path):
-        raise FileNotFoundError(
-            f"Missing {pkl_path}.\n"
-            f"Put your cpu_pack.pkl into artifacts/ and make sure it contains keys: svm_best, vec."
-        )
+def load_cpu_pack():
+    pkl_path = ensure_cpu_pack()
     with open(pkl_path, "rb") as f:
         pack = pickle.load(f)
 
@@ -174,8 +200,8 @@ def featurize(tokens: List[str], target_index: int, window: int = 3, wn_pos: Opt
     tokens = [str(t).lower() for t in tokens]
 
     t = tokens[target_index]
-    left = tokens[max(0, target_index - window) : target_index]
-    right = tokens[target_index + 1 : target_index + 1 + window]
+    left = tokens[max(0, target_index - window): target_index]
+    right = tokens[target_index + 1: target_index + 1 + window]
 
     feat = {
         "target": t,
@@ -262,9 +288,8 @@ def get_target_embedding(tokens: List[str], target_index: int, tokenizer, model,
     enc = {k: v.to(device) for k, v in enc.items()}
 
     with torch.no_grad():
-        hidden = model(**enc).last_hidden_state[0]  # [seq, hidden]
+        hidden = model(**enc).last_hidden_state[0]
 
-    # char span for the target token in " ".join(tokens)
     char_start = sum(len(t) + 1 for t in tokens[:target_index])
     char_end = char_start + len(tokens[target_index])
 
@@ -288,9 +313,9 @@ def get_gloss_embedding(synset, tokenizer, model, device, cache: Dict[str, torch
     enc = {k: v.to(device) for k, v in enc.items()}
 
     with torch.no_grad():
-        hidden = model(**enc).last_hidden_state[0]  # [seq, hidden]
-
+        hidden = model(**enc).last_hidden_state[0]
     emb = hidden.mean(dim=0)
+
     cache[key] = emb
     return emb
 
@@ -324,7 +349,6 @@ def bert_wsd(sentence: str, target_index: int, wn_pos: Optional[str] = None, mar
 
     scored.sort(key=lambda x: x[1], reverse=True)
 
-    # tie-break by MFS if too close
     if len(scored) > 1 and (scored[0][1] - scored[1][1]) < margin:
         return most_frequent_sense(lemma, wn_pos2)
 
@@ -344,11 +368,7 @@ def synset_details(synset_name: Optional[str]) -> Optional[Dict[str, str]]:
         return None
     try:
         s = wn.synset(synset_name)
-        return {
-            "synset": synset_name,
-            "definition": s.definition(),
-            "examples": "; ".join(s.examples()) if s.examples() else "(no examples)",
-        }
+        return {"synset": synset_name, "definition": s.definition(), "examples": "; ".join(s.examples()) if s.examples() else "(no examples)"}
     except Exception:
         return {"synset": synset_name, "definition": "(cannot load details)", "examples": "-"}
 
@@ -365,10 +385,7 @@ with st.sidebar:
 
     tokens_preview = simple_tokenize_like_dataset(sentence) if sentence.strip() else []
     if tokens_preview:
-        st.caption(
-            "Token index helper:\n\n"
-            + " | ".join([f"{i}:{t}" for i, t in enumerate(tokens_preview)])
-        )
+        st.caption("Token index helper:\n\n" + " | ".join([f"{i}:{t}" for i, t in enumerate(tokens_preview)]))
     else:
         st.caption("Type a sentence to see token indices.")
 
@@ -384,19 +401,12 @@ with st.sidebar:
         help="Index of the target word in the token list above.",
     )
 
-    wn_pos = st.selectbox(
-        "WordNet POS (optional)",
-        ["", "n", "v", "a", "r"],
-        index=0,
-        help="n=noun, v=verb, a=adj, r=adv. Leave blank for all POS.",
-    )
+    wn_pos = st.selectbox("WordNet POS (optional)", ["", "n", "v", "a", "r"], index=0)
     wn_pos = wn_pos if wn_pos != "" else None
 
     st.divider()
-
     show_details = st.toggle("Show WordNet details", value=True)
     show_debug = st.toggle("Show debug panel", value=False)
-
     run_btn = st.button("🚀 Run WSD", type="primary", use_container_width=True)
 
 # MAIN AREA
@@ -417,19 +427,24 @@ with left:
         unsafe_allow_html=True,
     )
 
-
 with right:
     st.subheader("Status")
-    # quick environment hints
     device_hint = "CUDA ✅" if torch.cuda.is_available() else "CPU 🧊"
-    pack_hint = "OK ✅" if os.path.exists("artifacts/cpu_pack.pkl") else "Missing ❌"
+
+    # HF hint (we don't require local file in repo anymore)
+    try:
+        _ = ensure_cpu_pack()
+        pack_hint = "OK ✅ (downloaded/cached)"
+    except Exception:
+        pack_hint = "Missing ❌ (HF repo/file not accessible)"
+
     st.markdown(
         f"""
 <div class="card">
   <div class="kv">
     <div class="k">BERT device</div><div class="v">{device_hint}</div>
     <div class="k">SVM pack</div><div class="v">{pack_hint}</div>
-    <div class="k">Note</div><div class="v">First run may be slower (model download/cache).</div>
+    <div class="k">Note</div><div class="v">First run may be slower (download/cache).</div>
   </div>
 </div>
 """,
@@ -438,9 +453,7 @@ with right:
 
 st.write("")
 
-# =========================
 # RUN
-# =========================
 if run_btn:
     try:
         LOGGER.info("Run | idx=%s | pos=%s | sent=%s", int(target_index), wn_pos, sentence)
@@ -448,7 +461,6 @@ if run_btn:
         with st.spinner("Running WSD..."):
             out = compare_3(sentence, int(target_index), wn_pos)
 
-        # Results cards
         c1, c2, c3 = st.columns(3)
 
         def render_result_card(col, title: str, badge: str, syn: Optional[str]):
@@ -474,7 +486,6 @@ if run_btn:
 
         st.markdown("<hr/>", unsafe_allow_html=True)
 
-        # friendly highlight
         toks = validate_input(sentence, int(target_index))
         tgt = toks[int(target_index)]
         st.markdown(
@@ -498,4 +509,4 @@ if run_btn:
         st.error(str(e))
 
 else:
-    st.info("Enter your query in the sidebar → select target_index → ​​press **Run WSD**. (Don't select an index outside the token list, the app will 'read' it 😌)")
+    st.info("Enter your query in the sidebar → select target_index → press **Run WSD**. 😌")
